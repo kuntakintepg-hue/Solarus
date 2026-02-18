@@ -583,11 +583,14 @@ f_check_tag(price, label_str) =>
 
 // Check key levels for interactions
 check_levels_for_rotation() =>
+    _w_eq  = (w_h  + w_l)  / 2
+    _m_eq  = (m_h  + m_l)  / 2
+    _d_eq  = (d_h  + d_l)  / 2
     levels_to_check = array.from(
-         w_h,  w_l,  w_eq := (w_h+w_l)/2,
+         w_h,  w_l,  _w_eq,
          pw_h, pw_l, pw_c,
-         m_h,  m_l,  m_eq := (m_h+m_l)/2,
-         d_h,  d_l,  d_eq := (d_h+d_l)/2
+         m_h,  m_l,  _m_eq,
+         d_h,  d_l,  _d_eq
          )
     labels_to_check = array.from(
          "W.H",  "W.L",  "W.EQ",
