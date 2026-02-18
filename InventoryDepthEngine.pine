@@ -1,0 +1,799 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © Inventory Depth Engine v1.0 — Multi-Timeframe Auction Mechanics Indicator
+// Designed for NQ (Nasdaq 100 Futures) | Compatible with any instrument
+// Philosophy: Raw price auction mechanics — inventory rebalancing, not ICT
+
+//@version=5
+indicator("Inventory Depth Engine", shorttitle="IDE", overlay=true, max_bars_back=5000, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// ============================================================
+// INPUT GROUPS
+// ============================================================
+
+// --- Timeframe Toggles ---
+grp_tf = "Timeframe Toggles"
+show_yearly  = input.bool(true,  "Show Yearly Levels",   group=grp_tf, tooltip="Show/hide all Yearly OHLC + EQ + Quarter levels")
+show_monthly = input.bool(true,  "Show Monthly Levels",  group=grp_tf, tooltip="Show/hide all Monthly OHLC + EQ + Quarter levels")
+show_weekly  = input.bool(true,  "Show Weekly Levels",   group=grp_tf, tooltip="Show/hide all Weekly OHLC + EQ + Quarter levels")
+show_daily   = input.bool(true,  "Show Daily Levels",    group=grp_tf, tooltip="Show/hide all Daily OHLC + EQ + Quarter levels")
+show_4h      = input.bool(true,  "Show 4H Levels",       group=grp_tf, tooltip="Show/hide all 4H OHLC + EQ + Quarter levels")
+show_1h      = input.bool(false, "Show 1H Levels",       group=grp_tf, tooltip="Show/hide all 1H OHLC + EQ + Quarter levels (can be noisy on 1H chart)")
+
+// --- Imbalance Settings ---
+grp_imb = "Imbalance Settings"
+show_imbalances  = input.bool(true,  "Show Inventory Voids",       group=grp_imb, tooltip="Display unfilled inventory voids (imbalances) as colored boxes")
+show_imb_1h      = input.bool(true,  "Detect on 1H",               group=grp_imb)
+show_imb_4h      = input.bool(true,  "Detect on 4H",               group=grp_imb)
+show_imb_daily   = input.bool(true,  "Detect on Daily",            group=grp_imb)
+max_voids        = input.int(30,     "Max Active Voids Tracked",    group=grp_imb, minval=5, maxval=100, tooltip="Maximum number of active unfilled voids to track. Higher values use more resources.")
+min_void_atr_mul = input.float(0.5,  "Min Void Size (ATR multiple)",group=grp_imb, minval=0.1, step=0.1, tooltip="Minimum size of a void relative to ATR to be considered significant")
+
+// --- Visual Settings ---
+grp_vis = "Visual Settings"
+col_yearly   = input.color(#FFD700, "Yearly Color",   group=grp_vis)
+col_monthly  = input.color(#FF6B35, "Monthly Color",  group=grp_vis)
+col_weekly   = input.color(#4ECDC4, "Weekly Color",   group=grp_vis)
+col_daily    = input.color(#A8DADC, "Daily Color",    group=grp_vis)
+col_4h       = input.color(#957DAD, "4H Color",       group=grp_vis)
+col_1h       = input.color(#6C757D, "1H Color",       group=grp_vis)
+col_bull_void = input.color(color.new(#2962FF, 80), "Bullish Void Color", group=grp_vis, tooltip="Color for bullish inventory voids (price left unfilled inventory below)")
+col_bear_void = input.color(color.new(#F23645, 80), "Bearish Void Color", group=grp_vis, tooltip="Color for bearish inventory voids (price left unfilled inventory above)")
+col_filled   = input.color(color.new(#26A69A, 70), "Filled Void Color",   group=grp_vis, tooltip="Color for fully rebalanced voids")
+show_targets = input.bool(true, "Show Rebalancing Targets",         group=grp_vis, tooltip="Draw target arrows/lines to nearest unfilled voids")
+show_confluence = input.bool(true, "Show Confluence Zones",         group=grp_vis, tooltip="Highlight zones where 3+ timeframe levels cluster")
+
+// --- Confluence Settings ---
+grp_conf = "Confluence Settings"
+conf_threshold = input.float(20.0, "Confluence Threshold (points)", group=grp_conf, minval=1.0, step=1.0, tooltip="How close (in price points) levels must be to form a confluence zone. Default 20pts works well for NQ.")
+conf_min_levels = input.int(3, "Min Levels for Confluence",         group=grp_conf, minval=2, maxval=10, tooltip="Minimum number of levels from DIFFERENT timeframes to declare a confluence zone")
+conf_critical   = input.int(5, "Levels for Critical Node",          group=grp_conf, minval=3, maxval=10, tooltip="Number of levels to declare a Critical Inventory Node (highest priority)")
+
+// --- Dashboard ---
+grp_dash = "Dashboard"
+show_dashboard   = input.bool(true, "Show Dashboard Table",  group=grp_dash, tooltip="Show the info table overlay in the top-right corner")
+show_rot_tracker = input.bool(true, "Show Rotation Tracker", group=grp_dash, tooltip="Show last 10 level interaction log")
+
+// --- Alert Settings ---
+grp_alert = "Alert Settings"
+alert_critical_node  = input.bool(true,  "Alert: Critical Inventory Node",      group=grp_alert)
+alert_high_void_fill = input.bool(true,  "Alert: High-Score Void Filled (7+)",  group=grp_alert)
+alert_pressure_3to1  = input.bool(true,  "Alert: Rebalancing Pressure 3:1",     group=grp_alert)
+alert_ytm_cross      = input.bool(true,  "Alert: Yearly/Monthly Level Cross",   group=grp_alert)
+alert_new_high_void  = input.bool(true,  "Alert: New High-Score Void (8+)",     group=grp_alert)
+
+// ============================================================
+// UTILITY FUNCTIONS
+// ============================================================
+
+f_line(price, col, lwidth, lstyle, show) =>
+    if show and not na(price)
+        line.new(bar_index - 1, price, bar_index, price, extend=extend.both, color=col, width=lwidth, style=lstyle)
+
+f_label(price, txt, col, show) =>
+    if show and not na(price)
+        label.new(bar_index, price, txt, color=color.new(color.black, 90), textcolor=col, style=label.style_label_left, size=size.small)
+
+// ============================================================
+// PART 1: MULTI-TIMEFRAME OHLC ENGINE
+// ============================================================
+
+// --- Security requests for each timeframe ---
+// Yearly
+[y_o, y_h, y_l, y_c] = request.security(syminfo.tickerid, "12M", [open, high, low, close], lookahead=barmerge.lookahead_off)
+[py_o, py_h, py_l, py_c] = request.security(syminfo.tickerid, "12M", [open[1], high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+// Monthly
+[m_o, m_h, m_l, m_c] = request.security(syminfo.tickerid, "M", [open, high, low, close], lookahead=barmerge.lookahead_off)
+[pm_o, pm_h, pm_l, pm_c] = request.security(syminfo.tickerid, "M", [open[1], high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+// Weekly
+[w_o, w_h, w_l, w_c] = request.security(syminfo.tickerid, "W", [open, high, low, close], lookahead=barmerge.lookahead_off)
+[pw_o, pw_h, pw_l, pw_c] = request.security(syminfo.tickerid, "W", [open[1], high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+// Daily
+[d_o, d_h, d_l, d_c] = request.security(syminfo.tickerid, "D", [open, high, low, close], lookahead=barmerge.lookahead_off)
+[pd_o, pd_h, pd_l, pd_c] = request.security(syminfo.tickerid, "D", [open[1], high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+// 4H
+[h4_o, h4_h, h4_l, h4_c] = request.security(syminfo.tickerid, "240", [open, high, low, close], lookahead=barmerge.lookahead_off)
+[ph4_o, ph4_h, ph4_l, ph4_c] = request.security(syminfo.tickerid, "240", [open[1], high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+// 1H
+[h1_o, h1_h, h1_l, h1_c] = request.security(syminfo.tickerid, "60", [open, high, low, close], lookahead=barmerge.lookahead_off)
+[ph1_o, ph1_h, ph1_l, ph1_c] = request.security(syminfo.tickerid, "60", [open[1], high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+// --- Draw HTF OHLC levels (only on last bar for performance) ---
+if barstate.islast
+    // ---- YEARLY ----
+    if show_yearly
+        // Current Year
+        y_eq = (y_h + y_l) / 2
+        y_q1 = y_l + (y_h - y_l) * 0.25
+        y_q3 = y_l + (y_h - y_l) * 0.75
+        line.new(bar_index - 50, y_o, bar_index, y_o, extend=extend.right, color=col_yearly, width=4, style=line.style_solid)
+        line.new(bar_index - 50, y_h, bar_index, y_h, extend=extend.right, color=col_yearly, width=4, style=line.style_solid)
+        line.new(bar_index - 50, y_l, bar_index, y_l, extend=extend.right, color=col_yearly, width=4, style=line.style_solid)
+        line.new(bar_index - 50, y_c, bar_index, y_c, extend=extend.right, color=col_yearly, width=4, style=line.style_solid)
+        line.new(bar_index - 50, y_eq, bar_index, y_eq, extend=extend.right, color=color.new(col_yearly, 50), width=2, style=line.style_solid)
+        line.new(bar_index - 50, y_q1, bar_index, y_q1, extend=extend.right, color=color.new(col_yearly, 65), width=1, style=line.style_dashed)
+        line.new(bar_index - 50, y_q3, bar_index, y_q3, extend=extend.right, color=color.new(col_yearly, 65), width=1, style=line.style_dashed)
+        label.new(bar_index, y_o, "Y.O", color=color.new(color.black, 90), textcolor=col_yearly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, y_h, "Y.H", color=color.new(color.black, 90), textcolor=col_yearly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, y_l, "Y.L", color=color.new(color.black, 90), textcolor=col_yearly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, y_c, "Y.C", color=color.new(color.black, 90), textcolor=col_yearly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, y_eq, "Y.EQ", color=color.new(color.black, 90), textcolor=col_yearly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, y_q1, "Y.Q1", color=color.new(color.black, 90), textcolor=col_yearly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, y_q3, "Y.Q3", color=color.new(color.black, 90), textcolor=col_yearly, style=label.style_label_left, size=size.small)
+        // Previous Year
+        py_eq = (py_h + py_l) / 2
+        line.new(bar_index - 50, py_o, bar_index, py_o, extend=extend.right, color=color.new(col_yearly, 55), width=3, style=line.style_solid)
+        line.new(bar_index - 50, py_h, bar_index, py_h, extend=extend.right, color=color.new(col_yearly, 55), width=3, style=line.style_solid)
+        line.new(bar_index - 50, py_l, bar_index, py_l, extend=extend.right, color=color.new(col_yearly, 55), width=3, style=line.style_solid)
+        line.new(bar_index - 50, py_c, bar_index, py_c, extend=extend.right, color=color.new(col_yearly, 55), width=3, style=line.style_solid)
+        line.new(bar_index - 50, py_eq, bar_index, py_eq, extend=extend.right, color=color.new(col_yearly, 70), width=1, style=line.style_dashed)
+        label.new(bar_index, py_o, "pY.O", color=color.new(color.black, 90), textcolor=color.new(col_yearly, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, py_h, "pY.H", color=color.new(color.black, 90), textcolor=color.new(col_yearly, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, py_l, "pY.L", color=color.new(color.black, 90), textcolor=color.new(col_yearly, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, py_c, "pY.C", color=color.new(color.black, 90), textcolor=color.new(col_yearly, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, py_eq, "pY.EQ", color=color.new(color.black, 90), textcolor=color.new(col_yearly, 40), style=label.style_label_left, size=size.tiny)
+
+    // ---- MONTHLY ----
+    if show_monthly
+        m_eq = (m_h + m_l) / 2
+        m_q1 = m_l + (m_h - m_l) * 0.25
+        m_q3 = m_l + (m_h - m_l) * 0.75
+        line.new(bar_index - 30, m_o, bar_index, m_o, extend=extend.right, color=col_monthly, width=3, style=line.style_solid)
+        line.new(bar_index - 30, m_h, bar_index, m_h, extend=extend.right, color=col_monthly, width=3, style=line.style_solid)
+        line.new(bar_index - 30, m_l, bar_index, m_l, extend=extend.right, color=col_monthly, width=3, style=line.style_solid)
+        line.new(bar_index - 30, m_c, bar_index, m_c, extend=extend.right, color=col_monthly, width=3, style=line.style_solid)
+        line.new(bar_index - 30, m_eq, bar_index, m_eq, extend=extend.right, color=color.new(col_monthly, 50), width=2, style=line.style_solid)
+        line.new(bar_index - 30, m_q1, bar_index, m_q1, extend=extend.right, color=color.new(col_monthly, 65), width=1, style=line.style_dashed)
+        line.new(bar_index - 30, m_q3, bar_index, m_q3, extend=extend.right, color=color.new(col_monthly, 65), width=1, style=line.style_dashed)
+        label.new(bar_index, m_o, "M.O", color=color.new(color.black, 90), textcolor=col_monthly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, m_h, "M.H", color=color.new(color.black, 90), textcolor=col_monthly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, m_l, "M.L", color=color.new(color.black, 90), textcolor=col_monthly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, m_c, "M.C", color=color.new(color.black, 90), textcolor=col_monthly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, m_eq, "M.EQ", color=color.new(color.black, 90), textcolor=col_monthly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, m_q1, "M.Q1", color=color.new(color.black, 90), textcolor=col_monthly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, m_q3, "M.Q3", color=color.new(color.black, 90), textcolor=col_monthly, style=label.style_label_left, size=size.small)
+        pm_eq = (pm_h + pm_l) / 2
+        line.new(bar_index - 30, pm_o, bar_index, pm_o, extend=extend.right, color=color.new(col_monthly, 55), width=2, style=line.style_solid)
+        line.new(bar_index - 30, pm_h, bar_index, pm_h, extend=extend.right, color=color.new(col_monthly, 55), width=2, style=line.style_solid)
+        line.new(bar_index - 30, pm_l, bar_index, pm_l, extend=extend.right, color=color.new(col_monthly, 55), width=2, style=line.style_solid)
+        line.new(bar_index - 30, pm_c, bar_index, pm_c, extend=extend.right, color=color.new(col_monthly, 55), width=2, style=line.style_solid)
+        line.new(bar_index - 30, pm_eq, bar_index, pm_eq, extend=extend.right, color=color.new(col_monthly, 70), width=1, style=line.style_dashed)
+        label.new(bar_index, pm_o, "pM.O", color=color.new(color.black, 90), textcolor=color.new(col_monthly, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, pm_h, "pM.H", color=color.new(color.black, 90), textcolor=color.new(col_monthly, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, pm_l, "pM.L", color=color.new(color.black, 90), textcolor=color.new(col_monthly, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, pm_c, "pM.C", color=color.new(color.black, 90), textcolor=color.new(col_monthly, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, pm_eq, "pM.EQ", color=color.new(color.black, 90), textcolor=color.new(col_monthly, 40), style=label.style_label_left, size=size.tiny)
+
+    // ---- WEEKLY ----
+    if show_weekly
+        w_eq = (w_h + w_l) / 2
+        w_q1 = w_l + (w_h - w_l) * 0.25
+        w_q3 = w_l + (w_h - w_l) * 0.75
+        line.new(bar_index - 20, w_o, bar_index, w_o, extend=extend.right, color=col_weekly, width=2, style=line.style_solid)
+        line.new(bar_index - 20, w_h, bar_index, w_h, extend=extend.right, color=col_weekly, width=2, style=line.style_solid)
+        line.new(bar_index - 20, w_l, bar_index, w_l, extend=extend.right, color=col_weekly, width=2, style=line.style_solid)
+        line.new(bar_index - 20, w_c, bar_index, w_c, extend=extend.right, color=col_weekly, width=2, style=line.style_solid)
+        line.new(bar_index - 20, w_eq, bar_index, w_eq, extend=extend.right, color=color.new(col_weekly, 50), width=2, style=line.style_solid)
+        line.new(bar_index - 20, w_q1, bar_index, w_q1, extend=extend.right, color=color.new(col_weekly, 65), width=1, style=line.style_dashed)
+        line.new(bar_index - 20, w_q3, bar_index, w_q3, extend=extend.right, color=color.new(col_weekly, 65), width=1, style=line.style_dashed)
+        label.new(bar_index, w_o, "W.O", color=color.new(color.black, 90), textcolor=col_weekly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, w_h, "W.H", color=color.new(color.black, 90), textcolor=col_weekly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, w_l, "W.L", color=color.new(color.black, 90), textcolor=col_weekly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, w_c, "W.C", color=color.new(color.black, 90), textcolor=col_weekly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, w_eq, "W.EQ", color=color.new(color.black, 90), textcolor=col_weekly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, w_q1, "W.Q1", color=color.new(color.black, 90), textcolor=col_weekly, style=label.style_label_left, size=size.small)
+        label.new(bar_index, w_q3, "W.Q3", color=color.new(color.black, 90), textcolor=col_weekly, style=label.style_label_left, size=size.small)
+        pw_eq = (pw_h + pw_l) / 2
+        line.new(bar_index - 20, pw_o, bar_index, pw_o, extend=extend.right, color=color.new(col_weekly, 55), width=1, style=line.style_solid)
+        line.new(bar_index - 20, pw_h, bar_index, pw_h, extend=extend.right, color=color.new(col_weekly, 55), width=1, style=line.style_solid)
+        line.new(bar_index - 20, pw_l, bar_index, pw_l, extend=extend.right, color=color.new(col_weekly, 55), width=1, style=line.style_solid)
+        line.new(bar_index - 20, pw_c, bar_index, pw_c, extend=extend.right, color=color.new(col_weekly, 55), width=1, style=line.style_solid)
+        line.new(bar_index - 20, pw_eq, bar_index, pw_eq, extend=extend.right, color=color.new(col_weekly, 70), width=1, style=line.style_dashed)
+        label.new(bar_index, pw_o, "pW.O", color=color.new(color.black, 90), textcolor=color.new(col_weekly, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, pw_h, "pW.H", color=color.new(color.black, 90), textcolor=color.new(col_weekly, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, pw_l, "pW.L", color=color.new(color.black, 90), textcolor=color.new(col_weekly, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, pw_c, "pW.C", color=color.new(color.black, 90), textcolor=color.new(col_weekly, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, pw_eq, "pW.EQ", color=color.new(color.black, 90), textcolor=color.new(col_weekly, 40), style=label.style_label_left, size=size.tiny)
+
+    // ---- DAILY ----
+    if show_daily
+        d_eq = (d_h + d_l) / 2
+        d_q1 = d_l + (d_h - d_l) * 0.25
+        d_q3 = d_l + (d_h - d_l) * 0.75
+        line.new(bar_index - 10, d_o, bar_index, d_o, extend=extend.right, color=col_daily, width=2, style=line.style_dashed)
+        line.new(bar_index - 10, d_h, bar_index, d_h, extend=extend.right, color=col_daily, width=2, style=line.style_dashed)
+        line.new(bar_index - 10, d_l, bar_index, d_l, extend=extend.right, color=col_daily, width=2, style=line.style_dashed)
+        line.new(bar_index - 10, d_c, bar_index, d_c, extend=extend.right, color=col_daily, width=2, style=line.style_dashed)
+        line.new(bar_index - 10, d_eq, bar_index, d_eq, extend=extend.right, color=color.new(col_daily, 50), width=1, style=line.style_dashed)
+        line.new(bar_index - 10, d_q1, bar_index, d_q1, extend=extend.right, color=color.new(col_daily, 65), width=1, style=line.style_dotted)
+        line.new(bar_index - 10, d_q3, bar_index, d_q3, extend=extend.right, color=color.new(col_daily, 65), width=1, style=line.style_dotted)
+        label.new(bar_index, d_o, "D.O", color=color.new(color.black, 90), textcolor=col_daily, style=label.style_label_left, size=size.small)
+        label.new(bar_index, d_h, "D.H", color=color.new(color.black, 90), textcolor=col_daily, style=label.style_label_left, size=size.small)
+        label.new(bar_index, d_l, "D.L", color=color.new(color.black, 90), textcolor=col_daily, style=label.style_label_left, size=size.small)
+        label.new(bar_index, d_c, "D.C", color=color.new(color.black, 90), textcolor=col_daily, style=label.style_label_left, size=size.small)
+        label.new(bar_index, d_eq, "D.EQ", color=color.new(color.black, 90), textcolor=col_daily, style=label.style_label_left, size=size.small)
+        pd_eq = (pd_h + pd_l) / 2
+        line.new(bar_index - 10, pd_o, bar_index, pd_o, extend=extend.right, color=color.new(col_daily, 55), width=1, style=line.style_dashed)
+        line.new(bar_index - 10, pd_h, bar_index, pd_h, extend=extend.right, color=color.new(col_daily, 55), width=1, style=line.style_dashed)
+        line.new(bar_index - 10, pd_l, bar_index, pd_l, extend=extend.right, color=color.new(col_daily, 55), width=1, style=line.style_dashed)
+        line.new(bar_index - 10, pd_c, bar_index, pd_c, extend=extend.right, color=color.new(col_daily, 55), width=1, style=line.style_dashed)
+        line.new(bar_index - 10, pd_eq, bar_index, pd_eq, extend=extend.right, color=color.new(col_daily, 70), width=1, style=line.style_dotted)
+        label.new(bar_index, pd_o, "pD.O", color=color.new(color.black, 90), textcolor=color.new(col_daily, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, pd_h, "pD.H", color=color.new(color.black, 90), textcolor=color.new(col_daily, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, pd_l, "pD.L", color=color.new(color.black, 90), textcolor=color.new(col_daily, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, pd_c, "pD.C", color=color.new(color.black, 90), textcolor=color.new(col_daily, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, pd_eq, "pD.EQ", color=color.new(color.black, 90), textcolor=color.new(col_daily, 40), style=label.style_label_left, size=size.tiny)
+
+    // ---- 4H ----
+    if show_4h
+        h4_eq = (h4_h + h4_l) / 2
+        line.new(bar_index - 5, h4_o, bar_index, h4_o, extend=extend.right, color=col_4h, width=1, style=line.style_dotted)
+        line.new(bar_index - 5, h4_h, bar_index, h4_h, extend=extend.right, color=col_4h, width=1, style=line.style_dotted)
+        line.new(bar_index - 5, h4_l, bar_index, h4_l, extend=extend.right, color=col_4h, width=1, style=line.style_dotted)
+        line.new(bar_index - 5, h4_c, bar_index, h4_c, extend=extend.right, color=col_4h, width=1, style=line.style_dotted)
+        line.new(bar_index - 5, h4_eq, bar_index, h4_eq, extend=extend.right, color=color.new(col_4h, 50), width=1, style=line.style_dotted)
+        label.new(bar_index, h4_o, "4H.O", color=color.new(color.black, 90), textcolor=col_4h, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, h4_h, "4H.H", color=color.new(color.black, 90), textcolor=col_4h, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, h4_l, "4H.L", color=color.new(color.black, 90), textcolor=col_4h, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, h4_c, "4H.C", color=color.new(color.black, 90), textcolor=col_4h, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, h4_eq, "4H.EQ", color=color.new(color.black, 90), textcolor=col_4h, style=label.style_label_left, size=size.tiny)
+        ph4_eq = (ph4_h + ph4_l) / 2
+        line.new(bar_index - 5, ph4_o, bar_index, ph4_o, extend=extend.right, color=color.new(col_4h, 60), width=1, style=line.style_dotted)
+        line.new(bar_index - 5, ph4_h, bar_index, ph4_h, extend=extend.right, color=color.new(col_4h, 60), width=1, style=line.style_dotted)
+        line.new(bar_index - 5, ph4_l, bar_index, ph4_l, extend=extend.right, color=color.new(col_4h, 60), width=1, style=line.style_dotted)
+        line.new(bar_index - 5, ph4_c, bar_index, ph4_c, extend=extend.right, color=color.new(col_4h, 60), width=1, style=line.style_dotted)
+        label.new(bar_index, ph4_o, "p4H.O", color=color.new(color.black, 90), textcolor=color.new(col_4h, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, ph4_h, "p4H.H", color=color.new(color.black, 90), textcolor=color.new(col_4h, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, ph4_l, "p4H.L", color=color.new(color.black, 90), textcolor=color.new(col_4h, 40), style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, ph4_c, "p4H.C", color=color.new(color.black, 90), textcolor=color.new(col_4h, 40), style=label.style_label_left, size=size.tiny)
+
+    // ---- 1H ----
+    if show_1h
+        h1_eq = (h1_h + h1_l) / 2
+        line.new(bar_index - 3, h1_o, bar_index, h1_o, extend=extend.right, color=col_1h, width=1, style=line.style_dotted)
+        line.new(bar_index - 3, h1_h, bar_index, h1_h, extend=extend.right, color=col_1h, width=1, style=line.style_dotted)
+        line.new(bar_index - 3, h1_l, bar_index, h1_l, extend=extend.right, color=col_1h, width=1, style=line.style_dotted)
+        line.new(bar_index - 3, h1_c, bar_index, h1_c, extend=extend.right, color=col_1h, width=1, style=line.style_dotted)
+        line.new(bar_index - 3, h1_eq, bar_index, h1_eq, extend=extend.right, color=color.new(col_1h, 50), width=1, style=line.style_dotted)
+        label.new(bar_index, h1_o, "1H.O", color=color.new(color.black, 90), textcolor=col_1h, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, h1_h, "1H.H", color=color.new(color.black, 90), textcolor=col_1h, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, h1_l, "1H.L", color=color.new(color.black, 90), textcolor=col_1h, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, h1_c, "1H.C", color=color.new(color.black, 90), textcolor=col_1h, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index, h1_eq, "1H.EQ", color=color.new(color.black, 90), textcolor=col_1h, style=label.style_label_left, size=size.tiny)
+
+// ============================================================
+// PART 2: INVENTORY IMBALANCE DETECTION ENGINE
+// ============================================================
+
+// Arrays to store void data
+var void_box      = array.new_box(0)
+var void_top      = array.new_float(0)
+var void_bot      = array.new_float(0)
+var void_is_bull  = array.new_bool(0)
+var void_score    = array.new_int(0)
+var void_tf_label = array.new_string(0)
+var void_filled   = array.new_bool(0)
+var void_fill_pct = array.new_float(0)
+var void_bar_age  = array.new_int(0)
+var void_score_lbl= array.new_label(0)
+
+// ATR for minimum size filter
+atr14 = ta.atr(14)
+
+// Imbalance detection on current chart timeframe (works on any TF you add indicator to)
+// For best results use on 1H chart — voids from 1H bars
+detect_imbalance(tf_label, tf_weight, show_tf) =>
+    if show_tf and show_imbalances and array.size(void_box) < max_voids
+        // 3-candle imbalance: candle[2] and candle[0] don't overlap
+        bullish_void = low[2] > high[0]   // price jumped up, left gap below
+        bearish_void = high[2] < low[0]   // price dropped, left gap above
+
+        if bullish_void or bearish_void
+            void_high = bullish_void ? low[2] : low[0]
+            void_low  = bullish_void ? high[0] : high[2]
+            void_size = math.abs(void_high - void_low)
+
+            // Filter: only significant voids
+            if void_size >= atr14 * min_void_atr_mul and void_size > 0
+                // Score calculation
+                atr_mult   = void_size / atr14
+                disp_score = math.min(3, math.round(atr_mult))
+                tf_bonus   = tf_weight
+                new_score  = math.min(10, disp_score + tf_bonus)
+
+                // Create box
+                new_b = box.new(bar_index - 2, void_high, bar_index + 100, void_low,
+                     border_color=bullish_void ? col_bull_void : col_bear_void,
+                     border_width=1,
+                     bgcolor=bullish_void ? col_bull_void : col_bear_void,
+                     extend=extend.right)
+
+                score_lbl = label.new(bar_index - 1, (void_high + void_low) / 2,
+                     str.tostring(new_score) + "  [" + tf_label + "]",
+                     color=color.new(color.black, 85),
+                     textcolor=bullish_void ? #2962FF : #F23645,
+                     style=label.style_label_center,
+                     size=size.tiny)
+
+                array.push(void_box,      new_b)
+                array.push(void_top,      void_high)
+                array.push(void_bot,      void_low)
+                array.push(void_is_bull,  bullish_void)
+                array.push(void_score,    new_score)
+                array.push(void_tf_label, tf_label)
+                array.push(void_filled,   false)
+                array.push(void_fill_pct, 0.0)
+                array.push(void_bar_age,  bar_index)
+                array.push(void_score_lbl,score_lbl)
+
+// Detect on current timeframe (user loads indicator on 1H, 4H, or Daily)
+// Use timeframe detection to apply proper weight
+is_1h    = timeframe.period == "60"
+is_4h    = timeframe.period == "240"
+is_daily = timeframe.isdaily
+
+tf_lbl    = is_daily ? "D" : is_4h ? "4H" : is_1h ? "1H" : timeframe.period
+tf_wt     = is_daily ? 4 : is_4h ? 3 : is_1h ? 2 : 2
+show_this = is_daily ? show_imb_daily : is_4h ? show_imb_4h : show_imb_1h
+
+detect_imbalance(tf_lbl, tf_wt, show_this)
+
+// --- Update existing voids: track fill percentage ---
+if array.size(void_box) > 0
+    for i = array.size(void_box) - 1 to 0
+        if not array.get(void_filled, i)
+            v_top  = array.get(void_top, i)
+            v_bot  = array.get(void_bot, i)
+            v_size = v_top - v_bot
+            is_bull = array.get(void_is_bull, i)
+            v_box   = array.get(void_box, i)
+            s_lbl   = array.get(void_score_lbl, i)
+
+            // How much has price penetrated?
+            if is_bull
+                fill = math.max(0, math.min(1.0, (v_top - low) / v_size))
+                array.set(void_fill_pct, i, fill * 100)
+                if low <= v_bot
+                    // Fully filled
+                    box.set_bgcolor(v_box, col_filled)
+                    box.set_border_color(v_box, col_filled)
+                    box.set_extend(v_box, extend.none)
+                    box.set_right(v_box, bar_index)
+                    array.set(void_filled, i, true)
+                    label.set_text(s_lbl, "100% [" + array.get(void_tf_label, i) + "] FILLED")
+                    label.set_textcolor(s_lbl, color.new(#26A69A, 0))
+                else if low <= v_top - v_size * 0.5
+                    box.set_border_style(v_box, line.style_dashed)
+                    label.set_text(s_lbl, str.tostring(math.round(array.get(void_fill_pct, i))) + "% [" + array.get(void_tf_label, i) + "]")
+            else
+                fill = math.max(0, math.min(1.0, (high - v_bot) / v_size))
+                array.set(void_fill_pct, i, fill * 100)
+                if high >= v_top
+                    box.set_bgcolor(v_box, col_filled)
+                    box.set_border_color(v_box, col_filled)
+                    box.set_extend(v_box, extend.none)
+                    box.set_right(v_box, bar_index)
+                    array.set(void_filled, i, true)
+                    label.set_text(s_lbl, "100% [" + array.get(void_tf_label, i) + "] FILLED")
+                    label.set_textcolor(s_lbl, color.new(#26A69A, 0))
+                else if high >= v_bot + v_size * 0.5
+                    box.set_border_style(v_box, line.style_dashed)
+                    label.set_text(s_lbl, str.tostring(math.round(array.get(void_fill_pct, i))) + "% [" + array.get(void_tf_label, i) + "]")
+
+// ============================================================
+// PART 3: REBALANCING TARGET PROJECTION
+// ============================================================
+
+var line  tgt_up_line   = na
+var line  tgt_dn_line   = na
+var label tgt_up_lbl    = na
+var label tgt_dn_lbl    = na
+var label pressure_lbl  = na
+var label priority_lbl  = na
+
+// Rebalancing pressure accumulators
+bull_pressure = 0.0
+bear_pressure = 0.0
+nearest_above = float(na)
+nearest_below = float(na)
+best_score    = 0
+best_score_price = float(na)
+best_score_is_bull = false
+
+if array.size(void_box) > 0
+    for i = 0 to array.size(void_box) - 1
+        if not array.get(void_filled, i)
+            v_top   = array.get(void_top, i)
+            v_bot   = array.get(void_bot, i)
+            v_mid   = (v_top + v_bot) / 2
+            v_size  = v_top - v_bot
+            v_sc    = array.get(void_score, i)
+            v_bull  = array.get(void_is_bull, i)
+
+            if v_mid > close
+                bull_pressure += v_size
+                if na(nearest_above) or v_mid < nearest_above
+                    nearest_above := v_mid
+            else
+                bear_pressure += v_size
+                if na(nearest_below) or v_mid > nearest_below
+                    nearest_below := v_mid
+
+            if v_sc > best_score
+                best_score := v_sc
+                best_score_price := v_mid
+                best_score_is_bull := v_bull
+
+// Draw rebalancing targets
+if barstate.islast and show_targets
+    // Clean up old
+    if not na(tgt_up_line)
+        line.delete(tgt_up_line)
+    if not na(tgt_dn_line)
+        line.delete(tgt_dn_line)
+    if not na(tgt_up_lbl)
+        label.delete(tgt_up_lbl)
+    if not na(tgt_dn_lbl)
+        label.delete(tgt_dn_lbl)
+    if not na(pressure_lbl)
+        label.delete(pressure_lbl)
+    if not na(priority_lbl)
+        label.delete(priority_lbl)
+
+    if not na(nearest_above)
+        tgt_up_line := line.new(bar_index, close, bar_index + 5, nearest_above, color=#26A69A, width=2, style=line.style_arrow_right)
+        tgt_up_lbl  := label.new(bar_index + 5, nearest_above,
+             "▲ " + str.tostring(math.round(nearest_above - close)) + "pts",
+             color=color.new(#26A69A, 80), textcolor=#26A69A,
+             style=label.style_label_left, size=size.small)
+
+    if not na(nearest_below)
+        tgt_dn_line := line.new(bar_index, close, bar_index + 5, nearest_below, color=#F23645, width=2, style=line.style_arrow_right)
+        tgt_dn_lbl  := label.new(bar_index + 5, nearest_below,
+             "▼ " + str.tostring(math.round(close - nearest_below)) + "pts",
+             color=color.new(#F23645, 80), textcolor=#F23645,
+             style=label.style_label_left, size=size.small)
+
+    // Priority void marker
+    if not na(best_score_price) and best_score >= 6
+        priority_lbl := label.new(bar_index + 8, best_score_price,
+             "★ PRIORITY [" + str.tostring(best_score) + "]",
+             color=color.new(#FFD700, 70), textcolor=#FFD700,
+             style=label.style_label_left, size=size.normal)
+
+// ============================================================
+// PART 4: CONFLUENCE HEATMAP ENGINE
+// ============================================================
+
+// Collect all key price levels into a single array for confluence checking
+var all_levels = array.new_float(0)
+var all_tf_ids = array.new_int(0)  // 1=Y, 2=M, 3=W, 4=D, 5=4H, 6=1H
+
+// Rebuild level list every bar (light version — only on last bar)
+if barstate.islast and show_confluence
+    array.clear(all_levels)
+    array.clear(all_tf_ids)
+
+    // Yearly
+    if show_yearly
+        for lv in array.from(y_o, y_h, y_l, y_c, (y_h+y_l)/2, py_o, py_h, py_l, py_c, (py_h+py_l)/2)
+            array.push(all_levels, lv)
+            array.push(all_tf_ids, 1)
+    // Monthly
+    if show_monthly
+        for lv in array.from(m_o, m_h, m_l, m_c, (m_h+m_l)/2, pm_o, pm_h, pm_l, pm_c, (pm_h+pm_l)/2)
+            array.push(all_levels, lv)
+            array.push(all_tf_ids, 2)
+    // Weekly
+    if show_weekly
+        for lv in array.from(w_o, w_h, w_l, w_c, (w_h+w_l)/2, pw_o, pw_h, pw_l, pw_c, (pw_h+pw_l)/2)
+            array.push(all_levels, lv)
+            array.push(all_tf_ids, 3)
+    // Daily
+    if show_daily
+        for lv in array.from(d_o, d_h, d_l, d_c, (d_h+d_l)/2, pd_o, pd_h, pd_l, pd_c, (pd_h+pd_l)/2)
+            array.push(all_levels, lv)
+            array.push(all_tf_ids, 4)
+    // 4H
+    if show_4h
+        for lv in array.from(h4_o, h4_h, h4_l, h4_c, (h4_h+h4_l)/2)
+            array.push(all_levels, lv)
+            array.push(all_tf_ids, 5)
+    // 1H
+    if show_1h
+        for lv in array.from(h1_o, h1_h, h1_l, h1_c, (h1_h+h1_l)/2)
+            array.push(all_levels, lv)
+            array.push(all_tf_ids, 6)
+
+    // Find clusters
+    n = array.size(all_levels)
+    if n > 1
+        already_marked = array.new_bool(n, false)
+        for i = 0 to n - 1
+            if not array.get(already_marked, i)
+                anchor = array.get(all_levels, i)
+                cluster_prices = array.new_float(0)
+                cluster_tfs    = array.new_int(0)
+                array.push(cluster_prices, anchor)
+                array.push(cluster_tfs,    array.get(all_tf_ids, i))
+
+                for j = i + 1 to n - 1
+                    lv_j = array.get(all_levels, j)
+                    if math.abs(lv_j - anchor) <= conf_threshold
+                        array.push(cluster_prices, lv_j)
+                        array.push(cluster_tfs,    array.get(all_tf_ids, j))
+                        array.set(already_marked, j, true)
+
+                // Count distinct timeframes in cluster
+                distinct_tfs = 0
+                tf_seen = array.new_bool(7, false)
+                for k = 0 to array.size(cluster_tfs) - 1
+                    tf_id = array.get(cluster_tfs, k)
+                    if not array.get(tf_seen, tf_id)
+                        array.set(tf_seen, tf_id, true)
+                        distinct_tfs += 1
+
+                if distinct_tfs >= conf_min_levels
+                    cl_hi = array.max(cluster_prices) + conf_threshold * 0.3
+                    cl_lo = array.min(cluster_prices) - conf_threshold * 0.3
+                    is_critical = distinct_tfs >= conf_critical
+
+                    zone_col = is_critical ?
+                         color.new(#FFD700, 65) :
+                         color.new(#9C27B0, 78)
+
+                    box.new(bar_index - 5, cl_hi, bar_index + 20, cl_lo,
+                         bgcolor=zone_col,
+                         border_color=is_critical ? #FFD700 : #9C27B0,
+                         border_width=is_critical ? 2 : 1,
+                         extend=extend.right)
+
+                    node_txt = is_critical ?
+                         "★ CRITICAL NODE (" + str.tostring(distinct_tfs) + " TFs)" :
+                         "● Confluence (" + str.tostring(distinct_tfs) + " TFs)"
+                    label.new(bar_index + 21, (cl_hi + cl_lo) / 2,
+                         node_txt,
+                         color=color.new(color.black, 85),
+                         textcolor=is_critical ? #FFD700 : #9C27B0,
+                         style=label.style_label_left,
+                         size=is_critical ? size.normal : size.small)
+
+// ============================================================
+// PART 5: INVENTORY ROTATION TRACKER
+// ============================================================
+
+var rot_levels   = array.new_string(0)
+var rot_dir      = array.new_string(0)
+var rot_result   = array.new_string(0)
+var rot_times    = array.new_string(0)
+var rot_table    = table(na)
+
+// Collect all tracked prices for tag detection
+f_check_tag(price, label_str) =>
+    tagged = not na(price) and (high >= price and low <= price)
+    accepted = close > price
+    rejected = close < price
+    dir_str = close[1] > price ? "↓" : "↑"
+    res_str = tagged ? (accepted ? "ACC" : "REJ") : ""
+    [tagged, dir_str, res_str]
+
+// Check key levels for interactions
+check_levels_for_rotation() =>
+    levels_to_check = array.from(
+         w_h,  w_l,  w_eq := (w_h+w_l)/2,
+         pw_h, pw_l, pw_c,
+         m_h,  m_l,  m_eq := (m_h+m_l)/2,
+         d_h,  d_l,  d_eq := (d_h+d_l)/2
+         )
+    labels_to_check = array.from(
+         "W.H",  "W.L",  "W.EQ",
+         "pW.H", "pW.L", "pW.C",
+         "M.H",  "M.L",  "M.EQ",
+         "D.H",  "D.L",  "D.EQ"
+         )
+    for i = 0 to array.size(levels_to_check) - 1
+        lv = array.get(levels_to_check, i)
+        lbl_str = array.get(labels_to_check, i)
+        [tagged, dir_str, res_str] = f_check_tag(lv, lbl_str)
+        if tagged and res_str != ""
+            if array.size(rot_levels) >= 10
+                array.shift(rot_levels)
+                array.shift(rot_dir)
+                array.shift(rot_result)
+                array.shift(rot_times)
+            array.push(rot_levels,  lbl_str)
+            array.push(rot_dir,     dir_str)
+            array.push(rot_result,  res_str)
+            array.push(rot_times,   str.format_time(time, "MM/dd HH:mm"))
+
+check_levels_for_rotation()
+
+// ============================================================
+// PART 6: DASHBOARD TABLE
+// ============================================================
+
+var dash_table = table(na)
+var rot_disp_table = table(na)
+
+if barstate.islast and show_dashboard
+    // Clean up
+    if not na(dash_table)
+        table.delete(dash_table)
+    if not na(rot_disp_table)
+        table.delete(rot_disp_table)
+
+    // Helper: position in range
+    yearly_range_pct = y_h != y_l ? math.round((close - y_l) / (y_h - y_l) * 100) : 0
+    monthly_range_pct = m_h != m_l ? math.round((close - m_l) / (m_h - m_l) * 100) : 0
+    weekly_range_pct  = w_h != w_l ? math.round((close - w_l) / (w_h - w_l) * 100) : 0
+    daily_range_pct   = d_h != d_l ? math.round((close - d_l) / (d_h - d_l) * 100) : 0
+
+    // Count active voids above / below
+    voids_above = 0
+    voids_below = 0
+    for i = 0 to array.size(void_filled) - 1
+        if not array.get(void_filled, i)
+            v_mid = (array.get(void_top, i) + array.get(void_bot, i)) / 2
+            if v_mid > close
+                voids_above += 1
+            else
+                voids_below += 1
+
+    // Bias string
+    bias_str = bull_pressure > bear_pressure * 3.0 ? "HEAVY ABOVE" :
+               bear_pressure > bull_pressure * 3.0 ? "HEAVY BELOW" :
+               bull_pressure > bear_pressure * 1.5 ? "ABOVE LEAN" :
+               bear_pressure > bull_pressure * 1.5 ? "BELOW LEAN" : "BALANCED"
+    bias_col = str.contains(bias_str, "ABOVE") ? #26A69A :
+               str.contains(bias_str, "BELOW") ? #F23645 : #9E9E9E
+
+    // Pressure ratio
+    press_ratio = bear_pressure > 0 ?
+         "↑ " + str.tostring(math.round(bull_pressure)) + "pts / ↓ " + str.tostring(math.round(bear_pressure)) + "pts" :
+         "↑ " + str.tostring(math.round(bull_pressure)) + "pts / ↓ 0pts"
+
+    // Best target distance
+    best_tgt_str = not na(nearest_above) and not na(nearest_below) ?
+         (nearest_above - close < close - nearest_below ?
+          "▲ " + str.tostring(math.round(nearest_above - close)) + "pts [above]" :
+          "▼ " + str.tostring(math.round(close - nearest_below)) + "pts [below]") :
+         not na(nearest_above) ? "▲ " + str.tostring(math.round(nearest_above - close)) + "pts [above]" :
+         not na(nearest_below) ? "▼ " + str.tostring(math.round(close - nearest_below)) + "pts [below]" : "None"
+
+    // Build main dashboard
+    dash_table := table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 82), border_color=color.new(color.white, 70), border_width=1, frame_color=color.new(color.white, 60), frame_width=1)
+
+    // Header
+    table.cell(dash_table, 0, 0, "INVENTORY DEPTH ENGINE", text_color=#FFD700, text_size=size.small, bgcolor=color.new(#1A1A2E, 60), text_halign=text.align_center)
+    table.cell(dash_table, 1, 0, syminfo.ticker + " | " + timeframe.period, text_color=#FFD700, text_size=size.small, bgcolor=color.new(#1A1A2E, 60))
+
+    // Row 1: Range positions
+    table.cell(dash_table, 0, 1, "Range Position", text_color=color.new(color.white, 30), text_size=size.tiny)
+    table.cell(dash_table, 1, 1,
+         "Y:" + str.tostring(yearly_range_pct) + "% | M:" + str.tostring(monthly_range_pct) + "% | W:" + str.tostring(weekly_range_pct) + "% | D:" + str.tostring(daily_range_pct) + "%",
+         text_color=color.white, text_size=size.tiny)
+
+    // Row 2: Rebalancing pressure
+    table.cell(dash_table, 0, 2, "Rebal Pressure", text_color=color.new(color.white, 30), text_size=size.tiny)
+    table.cell(dash_table, 1, 2, press_ratio, text_color=color.white, text_size=size.tiny)
+
+    // Row 3: Active void counts
+    table.cell(dash_table, 0, 3, "Active Voids", text_color=color.new(color.white, 30), text_size=size.tiny)
+    table.cell(dash_table, 1, 3, "↑ " + str.tostring(voids_above) + " above | ↓ " + str.tostring(voids_below) + " below", text_color=color.white, text_size=size.tiny)
+
+    // Row 4: Priority target
+    table.cell(dash_table, 0, 4, "Priority Target", text_color=color.new(color.white, 30), text_size=size.tiny)
+    table.cell(dash_table, 1, 4, best_tgt_str, text_color=#FFD700, text_size=size.tiny)
+
+    // Row 5: Highest-score void
+    table.cell(dash_table, 0, 5, "Top Void Score", text_color=color.new(color.white, 30), text_size=size.tiny)
+    table.cell(dash_table, 1, 5, best_score > 0 ? str.tostring(best_score) + "/10 @ " + str.tostring(math.round(best_score_price)) : "None", text_color=#E040FB, text_size=size.tiny)
+
+    // Row 6: Inventory Bias
+    table.cell(dash_table, 0, 6, "Inventory Bias", text_color=color.new(color.white, 30), text_size=size.tiny)
+    table.cell(dash_table, 1, 6, bias_str, text_color=bias_col, text_size=size.tiny)
+
+    // Row 7: Weekly dealer / inventory corridor (manual reference for NQ)
+    table.cell(dash_table, 0, 7, "W.EQ (Dealer)", text_color=color.new(color.white, 30), text_size=size.tiny)
+    table.cell(dash_table, 1, 7, str.tostring(math.round((w_h + w_l) / 2)), text_color=col_weekly, text_size=size.tiny)
+
+    // Row 8: Monthly corridor
+    table.cell(dash_table, 0, 8, "M.Range", text_color=color.new(color.white, 30), text_size=size.tiny)
+    table.cell(dash_table, 1, 8, str.tostring(math.round(m_l)) + " – " + str.tostring(math.round(m_h)), text_color=col_monthly, text_size=size.tiny)
+
+    // Row 9: Current Price
+    table.cell(dash_table, 0, 9, "Price", text_color=color.new(color.white, 30), text_size=size.tiny)
+    table.cell(dash_table, 1, 9, str.tostring(close), text_color=color.white, text_size=size.tiny)
+
+    // Rotation Tracker
+    if show_rot_tracker and array.size(rot_levels) > 0
+        rot_rows = math.min(10, array.size(rot_levels))
+        rot_disp_table := table.new(position.bottom_right, 4, rot_rows + 1,
+             bgcolor=color.new(color.black, 82),
+             border_color=color.new(color.white, 70),
+             border_width=1,
+             frame_color=color.new(color.white, 60),
+             frame_width=1)
+
+        table.cell(rot_disp_table, 0, 0, "Level",  text_color=#4ECDC4, text_size=size.tiny, bgcolor=color.new(#1A1A2E, 60))
+        table.cell(rot_disp_table, 1, 0, "Dir",    text_color=#4ECDC4, text_size=size.tiny, bgcolor=color.new(#1A1A2E, 60))
+        table.cell(rot_disp_table, 2, 0, "Result", text_color=#4ECDC4, text_size=size.tiny, bgcolor=color.new(#1A1A2E, 60))
+        table.cell(rot_disp_table, 3, 0, "Time",   text_color=#4ECDC4, text_size=size.tiny, bgcolor=color.new(#1A1A2E, 60))
+
+        for r = 0 to rot_rows - 1
+            idx = array.size(rot_levels) - 1 - r
+            if idx >= 0
+                res = array.get(rot_result, idx)
+                res_col = res == "ACC" ? #26A69A : #F23645
+                table.cell(rot_disp_table, 0, r + 1, array.get(rot_levels, idx), text_color=color.white, text_size=size.tiny)
+                table.cell(rot_disp_table, 1, r + 1, array.get(rot_dir,    idx), text_color=color.white, text_size=size.tiny)
+                table.cell(rot_disp_table, 2, r + 1, res,                        text_color=res_col,     text_size=size.tiny)
+                table.cell(rot_disp_table, 3, r + 1, array.get(rot_times,  idx), text_color=color.new(color.white, 40), text_size=size.tiny)
+
+// ============================================================
+// PART 7: ALERT CONDITIONS
+// ============================================================
+
+// Critical confluence node (detected via confluence engine)
+// We use a persistent flag
+var bool crit_node_alert = false
+var bool pressure_3to1_alert = false
+var bool ytm_cross_alert = false
+var bool high_void_fill_alert = false
+var bool new_high_void_alert = false
+
+// Check alerts each bar
+if alert_critical_node
+    // Re-check every bar for critical nodes near current price
+    n_lv = array.size(all_levels)
+    if n_lv > 0
+        for i = 0 to n_lv - 1
+            anchor = array.get(all_levels, i)
+            if math.abs(anchor - close) <= conf_threshold * 2
+                cnt = 0
+                tf_s = array.new_bool(7, false)
+                for j = 0 to n_lv - 1
+                    if math.abs(array.get(all_levels, j) - anchor) <= conf_threshold
+                        tf_id_j = array.get(all_tf_ids, j)
+                        if not array.get(tf_s, tf_id_j)
+                            array.set(tf_s, tf_id_j, true)
+                            cnt += 1
+                if cnt >= conf_critical
+                    crit_node_alert := true
+
+if alert_pressure_3to1
+    pressure_3to1_alert := (bull_pressure > bear_pressure * 3) or (bear_pressure > bull_pressure * 3)
+
+if alert_ytm_cross
+    ytm_cross_alert :=
+         (close > y_h and close[1] <= y_h) or
+         (close < y_l and close[1] >= y_l) or
+         (close > m_h and close[1] <= m_h) or
+         (close < m_l and close[1] >= m_l)
+
+if alert_high_void_fill
+    for i = 0 to array.size(void_filled) - 1
+        if array.get(void_filled, i) and array.get(void_score, i) >= 7
+            high_void_fill_alert := true
+
+if alert_new_high_void
+    // Checked in detect loop — approximated here
+    if array.size(void_score) > 0
+        newest_score = array.get(void_score, array.size(void_score) - 1)
+        if newest_score >= 8
+            new_high_void_alert := true
+
+alertcondition(crit_node_alert,      "IDE: Critical Inventory Node",      "Price is inside a Critical Inventory Node (5+ TF confluence)")
+alertcondition(high_void_fill_alert, "IDE: High-Score Void Filled (7+)",  "A high-score inventory void (7+) has been fully rebalanced")
+alertcondition(pressure_3to1_alert,  "IDE: Rebalancing Pressure 3:1",     "Rebalancing pressure ratio exceeds 3:1")
+alertcondition(ytm_cross_alert,      "IDE: Yearly/Monthly Level Crossed", "Price crossed a Yearly or Monthly OHLC level")
+alertcondition(new_high_void_alert,  "IDE: New High-Score Void (8+)",     "A new high-priority inventory void (score 8+) was created")
+
+// ============================================================
+// PLOT: Current price reference
+// ============================================================
+plot(close, display=display.none, title="Price Reference")
