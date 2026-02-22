@@ -478,34 +478,46 @@ if barstate.islast and show_confluence
     array.clear(all_levels)
     array.clear(all_tf_ids)
 
+    // Pre-compute EQ values (expressions cannot be passed directly into array.from())
+    cf_y_eq   = (y_h  + y_l)  / 2
+    cf_py_eq  = (py_h + py_l) / 2
+    cf_m_eq   = (m_h  + m_l)  / 2
+    cf_pm_eq  = (pm_h + pm_l) / 2
+    cf_w_eq   = (w_h  + w_l)  / 2
+    cf_pw_eq  = (pw_h + pw_l) / 2
+    cf_d_eq   = (d_h  + d_l)  / 2
+    cf_pd_eq  = (pd_h + pd_l) / 2
+    cf_h4_eq  = (h4_h + h4_l) / 2
+    cf_h1_eq  = (h1_h + h1_l) / 2
+
     // Yearly
     if show_yearly
-        for lv in array.from(y_o, y_h, y_l, y_c, (y_h+y_l)/2, py_o, py_h, py_l, py_c, (py_h+py_l)/2)
+        for lv in array.from(y_o, y_h, y_l, y_c, cf_y_eq, py_o, py_h, py_l, py_c, cf_py_eq)
             array.push(all_levels, lv)
             array.push(all_tf_ids, 1)
     // Monthly
     if show_monthly
-        for lv in array.from(m_o, m_h, m_l, m_c, (m_h+m_l)/2, pm_o, pm_h, pm_l, pm_c, (pm_h+pm_l)/2)
+        for lv in array.from(m_o, m_h, m_l, m_c, cf_m_eq, pm_o, pm_h, pm_l, pm_c, cf_pm_eq)
             array.push(all_levels, lv)
             array.push(all_tf_ids, 2)
     // Weekly
     if show_weekly
-        for lv in array.from(w_o, w_h, w_l, w_c, (w_h+w_l)/2, pw_o, pw_h, pw_l, pw_c, (pw_h+pw_l)/2)
+        for lv in array.from(w_o, w_h, w_l, w_c, cf_w_eq, pw_o, pw_h, pw_l, pw_c, cf_pw_eq)
             array.push(all_levels, lv)
             array.push(all_tf_ids, 3)
     // Daily
     if show_daily
-        for lv in array.from(d_o, d_h, d_l, d_c, (d_h+d_l)/2, pd_o, pd_h, pd_l, pd_c, (pd_h+pd_l)/2)
+        for lv in array.from(d_o, d_h, d_l, d_c, cf_d_eq, pd_o, pd_h, pd_l, pd_c, cf_pd_eq)
             array.push(all_levels, lv)
             array.push(all_tf_ids, 4)
     // 4H
     if show_4h
-        for lv in array.from(h4_o, h4_h, h4_l, h4_c, (h4_h+h4_l)/2)
+        for lv in array.from(h4_o, h4_h, h4_l, h4_c, cf_h4_eq)
             array.push(all_levels, lv)
             array.push(all_tf_ids, 5)
     // 1H
     if show_1h
-        for lv in array.from(h1_o, h1_h, h1_l, h1_c, (h1_h+h1_l)/2)
+        for lv in array.from(h1_o, h1_h, h1_l, h1_c, cf_h1_eq)
             array.push(all_levels, lv)
             array.push(all_tf_ids, 6)
 
