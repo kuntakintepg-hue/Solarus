@@ -478,7 +478,7 @@ if barstate.islast and show_confluence
     array.clear(all_levels)
     array.clear(all_tf_ids)
 
-    // Pre-compute EQ values (expressions cannot be passed directly into array.from())
+    // Pre-compute EQ midpoints (Pine Script v5 does not allow expressions inside array.from())
     cf_y_eq   = (y_h  + y_l)  / 2
     cf_py_eq  = (py_h + py_l) / 2
     cf_m_eq   = (m_h  + m_l)  / 2
@@ -490,36 +490,37 @@ if barstate.islast and show_confluence
     cf_h4_eq  = (h4_h + h4_l) / 2
     cf_h1_eq  = (h1_h + h1_l) / 2
 
+    // Use array.concat() to avoid "for...in array.from()" which requires a named variable
     // Yearly
     if show_yearly
-        for lv in array.from(y_o, y_h, y_l, y_c, cf_y_eq, py_o, py_h, py_l, py_c, cf_py_eq)
-            array.push(all_levels, lv)
-            array.push(all_tf_ids, 1)
+        _y_lvs = array.from(y_o, y_h, y_l, y_c, cf_y_eq, py_o, py_h, py_l, py_c, cf_py_eq)
+        array.concat(all_levels, _y_lvs)
+        array.concat(all_tf_ids, array.new_int(array.size(_y_lvs), 1))
     // Monthly
     if show_monthly
-        for lv in array.from(m_o, m_h, m_l, m_c, cf_m_eq, pm_o, pm_h, pm_l, pm_c, cf_pm_eq)
-            array.push(all_levels, lv)
-            array.push(all_tf_ids, 2)
+        _m_lvs = array.from(m_o, m_h, m_l, m_c, cf_m_eq, pm_o, pm_h, pm_l, pm_c, cf_pm_eq)
+        array.concat(all_levels, _m_lvs)
+        array.concat(all_tf_ids, array.new_int(array.size(_m_lvs), 2))
     // Weekly
     if show_weekly
-        for lv in array.from(w_o, w_h, w_l, w_c, cf_w_eq, pw_o, pw_h, pw_l, pw_c, cf_pw_eq)
-            array.push(all_levels, lv)
-            array.push(all_tf_ids, 3)
+        _w_lvs = array.from(w_o, w_h, w_l, w_c, cf_w_eq, pw_o, pw_h, pw_l, pw_c, cf_pw_eq)
+        array.concat(all_levels, _w_lvs)
+        array.concat(all_tf_ids, array.new_int(array.size(_w_lvs), 3))
     // Daily
     if show_daily
-        for lv in array.from(d_o, d_h, d_l, d_c, cf_d_eq, pd_o, pd_h, pd_l, pd_c, cf_pd_eq)
-            array.push(all_levels, lv)
-            array.push(all_tf_ids, 4)
+        _d_lvs = array.from(d_o, d_h, d_l, d_c, cf_d_eq, pd_o, pd_h, pd_l, pd_c, cf_pd_eq)
+        array.concat(all_levels, _d_lvs)
+        array.concat(all_tf_ids, array.new_int(array.size(_d_lvs), 4))
     // 4H
     if show_4h
-        for lv in array.from(h4_o, h4_h, h4_l, h4_c, cf_h4_eq)
-            array.push(all_levels, lv)
-            array.push(all_tf_ids, 5)
+        _h4_lvs = array.from(h4_o, h4_h, h4_l, h4_c, cf_h4_eq)
+        array.concat(all_levels, _h4_lvs)
+        array.concat(all_tf_ids, array.new_int(array.size(_h4_lvs), 5))
     // 1H
     if show_1h
-        for lv in array.from(h1_o, h1_h, h1_l, h1_c, cf_h1_eq)
-            array.push(all_levels, lv)
-            array.push(all_tf_ids, 6)
+        _h1_lvs = array.from(h1_o, h1_h, h1_l, h1_c, cf_h1_eq)
+        array.concat(all_levels, _h1_lvs)
+        array.concat(all_tf_ids, array.new_int(array.size(_h1_lvs), 6))
 
     // Find clusters
     n = array.size(all_levels)
